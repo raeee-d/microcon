@@ -1,11 +1,16 @@
 // Include Libraries
-#include <Wire.h>
-#include <I2Cdev.h>
-#include <MPU6050.h>
-#include <TinyGPSPlus.h>
-#include <HardwareSerial.h>
-#include <RH_ASK.h>
-#include <SPI.h>
+#include <Wire.h> // Enables I2C communication
+#include <WiFi.h> // ESP32 WiFi library to connect to hotspots
+#include <I2Cdev.h> // Simplifies I2C communication for MPU6050
+#include <MPU6050.h> // Library to interface with the MPU6050
+#include <TinyGPSPlus.h> // Parses/analyzes GPS data (NMEA sentences) from NEO-6M
+#include <HardwareSerial.h> // Enables use of extra UART ports on ESP32
+#include <RH_ASK.h> // RadioHead library for ASK RF communication(433 MHz)
+#include <SPI.h> // Required for RadioHead even if not using SPI directly
+
+//Stores WiFi name and password for ESP32 to connect.
+const char* ssid = "WiFi name here"; // WiFi (hotspot) name
+const char* password = "WiFi pass here";
 
 // Pin Definitions
 #define GPS_RX_PIN 4     // GPS TX → GPIO4 (ESP32 receives here)
@@ -16,18 +21,19 @@
 #define MODEM_RX 17      // SIM800L RX pin
 
 // Global Variables
-TinyGPSPlus gps;
-MPU6050 mpu;
+TinyGPSPlus gps; // GPS parser object
+MPU6050 mpu; // MPU6050 object
 HardwareSerial SerialGPS(1);  // UART1 for GPS
 HardwareSerial SerialAT(2);   // UART2 for SIM800L
 
-float Lat = 0;
-float Lng = 0;
-float horizontal_speed = 0;
-int16_t ax, ay, az;
-float ACC_THRESHOLD = -5.0;
-float SPEED_THRESHOLD = 35.0 / 3.6; // m/s
+float Lat = 0;  // Holds the Lat value from GPS
+float Lng = 0;  // Holds the Lng value from GPS
+float horizontal_speed = 0;  // Holds the speed (mps) from GPS
+int16_t ax, ay, az; // Raw values from MPU ax=acc along x-axis, ay=acc along y-axis, az=acc along z-axis
+float ACC_THRESHOLD = -5.0;  // Threshold for deceleration in m/s²
+float SPEED_THRESHOLD = 35.0 / 3.6;  // speed in m/s
 
+// To track the state of the helmet and system
 bool helmetWorn = false;
 bool strapFastened = false;
 bool alreadySentSignal = false;
@@ -37,22 +43,24 @@ bool accidentDetected = false;
 unsigned long lastMpuCheck = 0;
 unsigned long lastGsmCheck = 0;
 unsigned long lastGpsPrint = 0;
+
+// Delays of 1sec on printing in serial mon
 const unsigned long MPU_INTERVAL = 1000;
 const unsigned long GSM_INTERVAL = 1000;
 const unsigned long GPS_PRINT_INTERVAL = 1000;
 
-RH_ASK driver(2000, 4, 5, 0); // 433 MHz Transmitter setup (TX: 5, RX: 4)
+RH_ASK driver(2000, 4, 5, 0);  // 433 MHz Transmitter setup (TX: 5, RX: 4)
 
 // GSM Setup
-#define TINY_GSM_MODEM_SIM800
+#define TINY_GSM_MODEM_SIM800 // Tells the TinyGSM library to use SIM800L
 #define SerialMon Serial
-#define TINY_GSM_DEBUG SerialMon
-#define ADMIN_NUMBER "+639099581762"
+#define TINY_GSM_DEBUG SerialMon // For debugging
+#define ADMIN_NUMBER "contact person's mobile No. here"
 
-#include <TinyGsmClient.h>
+#include <TinyGsmClient.h>  // Library for SIM800L 
 
 #ifdef DUMP_AT_COMMANDS
-#include <StreamDebugger.h>
+#include <StreamDebugger.h> // Debugging tool, suitable for GSM mdoule
 StreamDebugger debugger(SerialAT, SerialMon);
 TinyGsm modem(debugger);
 #else
@@ -62,6 +70,18 @@ TinyGsm modem(SerialAT);
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Connect to wifi 
+  WiFi.begin(ssid, password); // Starts the process of connecting the ESP32 to the WiFi
+  Serial.print("Connecting to WiFi");
+
+  // Checks the WiFi connection status repeatedly.
+  while (WiFi.status() != WL_CONNECTED) {
+  delay(500); // Check connection status again after 0.5sec
+  Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi!"); // Printed once connected
+  Serial.print("IP Address: "); Serial.println(WiFi.localIP()); // Displays the local IP address
 
   // Initialize GPS on UART1
   SerialGPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -84,14 +104,14 @@ void setup() {
   SerialAT.begin(9600, SERIAL_8N1, MODEM_TX, MODEM_RX);
   delay(3000);
   modem.restart();
-  if (modem.getSimStatus() != 1) {
+  if (modem.getSimStatus() != 1) {  // For when SIM cant be detected
     Serial.println("SIM not ready.");
   } else {
     Serial.println("GSM modem ready.");
   }
 
   // Initialize 433 MHz Transmitter
-  if (!driver.init()) {
+  if (!driver.init()) {  // Checks if RF module is working and ready to send data
     Serial.println("433 MHz Transmitter init failed.");
   } else {
     Serial.println("RF Transmitter ready.");
@@ -107,26 +127,26 @@ void loop() {
 
   // To Process GPS Data Continuously 
   while (SerialGPS.available()) {
-    char c = SerialGPS.read();
-    gps.encode(c);
+    char c = SerialGPS.read();  // Get NMEA sentences from GPS
+    gps.encode(c);  // Extract valid location/speed data (NMEA sentences).
   }
 
   // Update location and speed if GPS is valid
   if (gps.location.isValid()) {
-    Lat = gps.location.lat();
-    Lng = gps.location.lng();
+    Lat = gps.location.lat();  // Latitude
+    Lng = gps.location.lng();  // Longitude
     if (gps.speed.isValid()) {
-      horizontal_speed = gps.speed.mps();
+      horizontal_speed = gps.speed.mps();  // Get speed on GPS in m/s
     }
   }
 
   // For Debugging GPS Data
   if (currentMillis - lastGpsPrint >= GPS_PRINT_INTERVAL) {
     if (gps.location.isValid()) {
-      Serial.print("Lat: "); Serial.print(Lat, 6);
-      Serial.print(" | Lng: "); Serial.print(Lng, 6);
-      Serial.print(" | Speed: "); Serial.print(horizontal_speed * 3.6);
-      Serial.print(" km/h | Sats: "); Serial.println(gps.satellites.value());
+      Serial.print("Lat: "); Serial.print(Lat, 6);  // Get and print latitude with 6 decimal value
+      Serial.print(" | Lng: "); Serial.print(Lng, 6);  // Get and print longitude with 6 decimal value
+      Serial.print(" | Speed: "); Serial.print(horizontal_speed * 3.6);  // Get speed value, convert to km/h
+      Serial.print(" km/h | Sats: "); Serial.println(gps.satellites.value());  // To know how many satellites are present
     } else {
       Serial.println("Waiting for GPS fix...");
     }
@@ -138,7 +158,7 @@ void loop() {
 
   // Check MPU6050
   if (currentMillis - lastMpuCheck >= MPU_INTERVAL) {
-    getMpuData();
+    getMpuData();  // Call MPU helper function
     lastMpuCheck = currentMillis;
   }
 
@@ -149,14 +169,16 @@ void loop() {
     bool mpuAccidentOK = accidentDetected; // set by getMpuData()
     
     if (helmetWorn && strapFastened && !alreadySentSignal && gpsFix && gpsSpeedOK && mpuAccidentOK) {
-      sendSMS();
+      sendSMS();  // Call sms helper function
       alreadySentSignal = true;
     }
     lastGsmCheck = currentMillis;
   }
 }
 
+// Helper function for the helmet and strap detection
 void checkHelmetAndStrap() {
+  // Read states for reed switch and IR
   int mrsState = digitalRead(MRS);
   int IrState = digitalRead(IrRcvr);
 
@@ -165,7 +187,7 @@ void checkHelmetAndStrap() {
     strapFastened = true;
     Serial.println("Helmet worn, strap fastened.");
     delay(1000);
-    driver.send((uint8_t *)"ON", 2);
+    driver.send((uint8_t *)"ON", 2);  // Send signal to the RF receiver
     driver.waitPacketSent();
   } else if (mrsState == LOW && IrState == LOW) {
     helmetWorn = false;
@@ -180,13 +202,15 @@ void checkHelmetAndStrap() {
   }
 }
 
+// Helper function for MPU reading
 void getMpuData() {
   mpu.getAcceleration(&ax, &ay, &az);
 
-  float ax_g = ax / 16384.0;
+  // Convert Raw MPU data to gravitational force
+  float ax_g = ax / 16384.0;  // Sensitivityn is 16384 LSB/g (Least Significant Bits per g) at ±2g range
   float ay_g = ay / 16384.0;
-  float horiz_g = sqrt(ax_g * ax_g + ay_g * ay_g);
-  float horiz_acc = horiz_g * 9.80665;
+  float horiz_g = sqrt(ax_g * ax_g + ay_g * ay_g);  // Get horizontal acceleration
+  float horiz_acc = horiz_g * 9.80665;  // Convert to m/s^2
 
   Serial.print("Ax_g: "); Serial.print(ax_g);
   Serial.print(" | Ay_g: "); Serial.print(ay_g);
@@ -200,6 +224,7 @@ void getMpuData() {
   }
 }
 
+// Helper function for sending SMS
 void sendSMS() {
   String message = "Alert: Accident detected! Location: https://maps.google.com/?g=" + String(Lat, 6) + ", " + String(Lng, 6);
   bool smsSent = modem.sendSMS(ADMIN_NUMBER, message.c_str());
