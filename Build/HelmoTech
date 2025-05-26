@@ -1,0 +1,212 @@
+// Include Libraries
+#include <Wire.h>
+#include <I2Cdev.h>
+#include <MPU6050.h>
+#include <TinyGPSPlus.h>
+#include <HardwareSerial.h>
+#include <RH_ASK.h>
+#include <SPI.h>
+
+// Pin Definitions
+#define GPS_RX_PIN 4     // GPS TX → GPIO4 (ESP32 receives here)
+#define GPS_TX_PIN 14    // GPS RX ← GPIO14 (ESP32 transmits here)
+#define MRS 26           // Reed switch pin for strap
+#define IrRcvr 27        // IR receiver pin for helmet detection
+#define MODEM_TX 18      // SIM800L TX pin
+#define MODEM_RX 17      // SIM800L RX pin
+
+// Global Variables
+TinyGPSPlus gps;
+MPU6050 mpu;
+HardwareSerial SerialGPS(1);  // UART1 for GPS
+HardwareSerial SerialAT(2);   // UART2 for SIM800L
+
+float Lat = 0;
+float Lng = 0;
+float horizontal_speed = 0;
+int16_t ax, ay, az;
+float ACC_THRESHOLD = -5.0;
+float SPEED_THRESHOLD = 35.0 / 3.6; // m/s
+
+bool helmetWorn = false;
+bool strapFastened = false;
+bool alreadySentSignal = false;
+bool accidentDetected = false;
+
+// Timing variables
+unsigned long lastMpuCheck = 0;
+unsigned long lastGsmCheck = 0;
+unsigned long lastGpsPrint = 0;
+const unsigned long MPU_INTERVAL = 1000;
+const unsigned long GSM_INTERVAL = 1000;
+const unsigned long GPS_PRINT_INTERVAL = 1000;
+
+RH_ASK driver(2000, 4, 5, 0); // 433 MHz Transmitter setup (TX: 5, RX: 4)
+
+// GSM Setup
+#define TINY_GSM_MODEM_SIM800
+#define SerialMon Serial
+#define TINY_GSM_DEBUG SerialMon
+#define ADMIN_NUMBER "+639099581762"
+
+#include <TinyGsmClient.h>
+
+#ifdef DUMP_AT_COMMANDS
+#include <StreamDebugger.h>
+StreamDebugger debugger(SerialAT, SerialMon);
+TinyGsm modem(debugger);
+#else
+TinyGsm modem(SerialAT);
+#endif
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  // Initialize GPS on UART1
+  SerialGPS.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  delay(3000);
+  Serial.println("Initializing GPS...");
+
+  // Initialize MPU6050 (I2C)
+  Wire.begin(21, 22);  // SDA, SCL
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU6050 connection failed!");
+  } else {
+    Serial.println("MPU6050 connected.");
+  }
+
+  // Initialize SIM800L on UART2
+  modem.sendAT("+CSCA=\"+639180000101\"");
+  delay(500);
+
+  SerialAT.begin(9600, SERIAL_8N1, MODEM_TX, MODEM_RX);
+  delay(3000);
+  modem.restart();
+  if (modem.getSimStatus() != 1) {
+    Serial.println("SIM not ready.");
+  } else {
+    Serial.println("GSM modem ready.");
+  }
+
+  // Initialize 433 MHz Transmitter
+  if (!driver.init()) {
+    Serial.println("433 MHz Transmitter init failed.");
+  } else {
+    Serial.println("RF Transmitter ready.");
+  }
+
+  pinMode(MRS, INPUT);
+  pinMode(IrRcvr, INPUT);
+  Serial.println("System Initialized");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // To Process GPS Data Continuously 
+  while (SerialGPS.available()) {
+    char c = SerialGPS.read();
+    gps.encode(c);
+  }
+
+  // Update location and speed if GPS is valid
+  if (gps.location.isValid()) {
+    Lat = gps.location.lat();
+    Lng = gps.location.lng();
+    if (gps.speed.isValid()) {
+      horizontal_speed = gps.speed.mps();
+    }
+  }
+
+  // For Debugging GPS Data
+  if (currentMillis - lastGpsPrint >= GPS_PRINT_INTERVAL) {
+    if (gps.location.isValid()) {
+      Serial.print("Lat: "); Serial.print(Lat, 6);
+      Serial.print(" | Lng: "); Serial.print(Lng, 6);
+      Serial.print(" | Speed: "); Serial.print(horizontal_speed * 3.6);
+      Serial.print(" km/h | Sats: "); Serial.println(gps.satellites.value());
+    } else {
+      Serial.println("Waiting for GPS fix...");
+    }
+    lastGpsPrint = currentMillis;
+  }
+
+  // Helmet and Strap Check
+  checkHelmetAndStrap();
+
+  // Check MPU6050
+  if (currentMillis - lastMpuCheck >= MPU_INTERVAL) {
+    getMpuData();
+    lastMpuCheck = currentMillis;
+  }
+
+  // Accident Detection and SMS Sending
+  if (currentMillis - lastGsmCheck >= GSM_INTERVAL) {
+    bool gpsFix = gps.location.isValid();
+    bool gpsSpeedOK = horizontal_speed >= SPEED_THRESHOLD;
+    bool mpuAccidentOK = accidentDetected; // set by getMpuData()
+    
+    if (helmetWorn && strapFastened && !alreadySentSignal && gpsFix && gpsSpeedOK && mpuAccidentOK) {
+      sendSMS();
+      alreadySentSignal = true;
+    }
+    lastGsmCheck = currentMillis;
+  }
+}
+
+void checkHelmetAndStrap() {
+  int mrsState = digitalRead(MRS);
+  int IrState = digitalRead(IrRcvr);
+
+  if (mrsState == HIGH && IrState == LOW) {
+    helmetWorn = true;
+    strapFastened = true;
+    Serial.println("Helmet worn, strap fastened.");
+    delay(1000);
+    driver.send((uint8_t *)"ON", 2);
+    driver.waitPacketSent();
+  } else if (mrsState == LOW && IrState == LOW) {
+    helmetWorn = false;
+    strapFastened = false;
+    Serial.println("Fasten your strap!");
+    delay(1000);
+  } else if (mrsState == HIGH && IrState == HIGH) {
+    helmetWorn = false;
+    strapFastened = false;
+    Serial.println("Wear helmet first!");
+    delay(1000);
+  }
+}
+
+void getMpuData() {
+  mpu.getAcceleration(&ax, &ay, &az);
+
+  float ax_g = ax / 16384.0;
+  float ay_g = ay / 16384.0;
+  float horiz_g = sqrt(ax_g * ax_g + ay_g * ay_g);
+  float horiz_acc = horiz_g * 9.80665;
+
+  Serial.print("Ax_g: "); Serial.print(ax_g);
+  Serial.print(" | Ay_g: "); Serial.print(ay_g);
+  Serial.print(" | Horiz Acc (m/s²): "); Serial.println(horiz_acc);
+
+  if (horizontal_speed >= SPEED_THRESHOLD && horiz_acc > fabs(ACC_THRESHOLD)) {
+    accidentDetected = true;
+    Serial.println("Sudden deceleration detected, possible accident.");
+  } else {
+    accidentDetected = false;
+  }
+}
+
+void sendSMS() {
+  String message = "Alert: Accident detected! Location: https://maps.google.com/?g=" + String(Lat, 6) + ", " + String(Lng, 6);
+  bool smsSent = modem.sendSMS(ADMIN_NUMBER, message.c_str());
+
+  if (smsSent) {
+    Serial.println("SMS sent successfully!");
+  } else {
+    Serial.println("Failed to send SMS.");
+  }
+}
